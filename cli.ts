@@ -126,7 +126,7 @@ export interface CliClient {
   sessionId?: string | null;
   connect(session: SessionRegistration, sessionId?: string): Promise<void>;
   listSessions(options?: { timeoutMs?: number }): Promise<SessionInfo[]>;
-  send(to: string, options: { text: string; expectsReply?: boolean; crossMachine?: CrossMachineProvenance }): Promise<{ id: string; delivered: boolean; reason?: string }>;
+  send(to: string, options: { text: string; expectsReply?: boolean; crossMachine?: CrossMachineProvenance }): Promise<{ id: string; delivered: boolean; reason?: string; delivery?: string; injected?: boolean }>;
   on(event: "message", listener: (from: SessionInfo, message: Message) => void): unknown;
   disconnect(): Promise<void>;
 }
@@ -224,8 +224,8 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
         },
       });
       if (!result.delivered) return reportFailure(`relay delivery failed: ${result.reason ?? "unknown reason"}`);
-      if (opts.json) out.write(`${JSON.stringify({ ok: true, delivered: true, id: result.id, origin: relaySenderName(envelope.origin), trust: envelope.trust })}\n`);
-      else out.write(`relayed from ${relaySenderName(envelope.origin)} to ${envelope.target} (${result.id})\n`);
+      if (opts.json) out.write(`${JSON.stringify({ ok: true, accepted: true, delivered: result.delivery !== "queued", delivery: result.delivery, injected: result.injected, id: result.id, origin: relaySenderName(envelope.origin), trust: envelope.trust })}\n`);
+      else out.write(`${result.delivery === "queued" ? "queued, not yet injected" : "relayed"} from ${relaySenderName(envelope.origin)} to ${envelope.target} (${result.id})\n`);
       return 0;
     }
 
@@ -247,9 +247,9 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
         return reportFailure(`delivery failed: ${result.reason ?? "unknown reason"}`);
       }
       if (opts.json) {
-        out.write(`${JSON.stringify({ ok: true, delivered: true, id: result.id }, null, 2)}\n`);
+        out.write(`${JSON.stringify({ ok: true, accepted: true, delivered: result.delivery !== "queued", delivery: result.delivery, injected: result.injected, id: result.id }, null, 2)}\n`);
       } else {
-        out.write(`delivered to ${opts.to} (${result.id})\n`);
+        out.write(`${result.delivery === "queued" ? "queued, not yet injected for" : "delivered to"} ${opts.to} (${result.id})\n`);
       }
       return 0;
     }
@@ -327,7 +327,7 @@ async function readProcessStdin(): Promise<string> {
 export async function runMain(argv: readonly string[] = process.argv.slice(2)): Promise<number> {
   const config = loadConfig();
   return runCli(argv, {
-    client: new IntercomClient(),
+    client: new IntercomClient({ observeDelivery: config.headlessFollowUp }),
     machineName: config.crossMachine.machineName,
     crossMachineSend: (target, text, origin) => sendCrossMachine(target, text, origin, {
       remoteCommand: config.crossMachine.remoteCommand,

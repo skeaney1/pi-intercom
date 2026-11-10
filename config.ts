@@ -57,6 +57,9 @@ export interface IntercomConfig {
   /** Delivery priority for peers arriving during interactive agent runs */
   busyDelivery: BusyDeliveryPolicy;
 
+  /** Opt in to bounded native follow-ups for busy headless sends. Asks still reject immediately. */
+  headlessFollowUp: boolean;
+
   /** Optional custom status suffix shown after automatic lifecycle status */
   status?: string;
 
@@ -83,6 +86,7 @@ const defaults: IntercomConfig = {
   confirmSend: false,
   inboundTrigger: "always",
   busyDelivery: "steer",
+  headlessFollowUp: false,
   enabled: true,
   replyHint: true,
   crossMachine: {
@@ -165,6 +169,13 @@ export function loadConfig(): IntercomConfig {
         throw new Error(`"busyDelivery" must be "steer" or "human-first"`);
       }
       config.busyDelivery = parsedConfig.busyDelivery;
+    }
+
+    if (Object.hasOwn(parsedConfig, "headlessFollowUp")) {
+      if (typeof parsedConfig.headlessFollowUp !== "boolean") {
+        throw new Error('"headlessFollowUp" must be a boolean');
+      }
+      config.headlessFollowUp = parsedConfig.headlessFollowUp;
     }
 
     if (Object.hasOwn(parsedConfig, "replyHint")) {

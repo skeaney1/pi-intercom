@@ -196,14 +196,18 @@ function undeliveredText(target: string, result: SendResult): string {
     : `Delivery to "${target}" could not be confirmed: ${reason}. The message may still arrive, so sending it again could duplicate it.`;
 }
 
-function queuedText(target: string, what = "message"): string {
-  return `Session "${target}" is not connected. The ${what} is waiting in the broker mailbox until that session reconnects.`;
+function queuedText(target: string, what = "message", observed = false): string {
+  return observed
+    ? `The ${what} for session "${target}" is queued, not yet confirmed in Pi context. Offline recipients wait in the broker mailbox until they reconnect.`
+    : `Session "${target}" is not connected. The ${what} is waiting in the broker mailbox until that session reconnects.`;
 }
 
 function deliveryDetails(result: SendResult): Record<string, unknown> {
   return {
     messageId: result.id,
-    delivered: result.delivered,
+    delivered: result.injected === false ? false : result.delivered,
+    accepted: result.delivered,
+    ...(result.injected !== undefined ? { injected: result.injected } : {}),
     delivery: result.delivery,
     retryable: result.retryable,
     outcomeKnown: result.outcomeKnown,
@@ -718,6 +722,11 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
   let runtimeGeneration = 0;
   let agentRunning = false;
   const heldInboundMessages: InboundMessageEntry[] = [];
+  const headlessFollowUps = new Map<string, { bytes: number }>();
+  function expireHeadlessFollowUps(detail: string): void {
+    for (const id of headlessFollowUps.keys()) emitMessageReceipt(id, "expired", detail);
+    headlessFollowUps.clear();
+  }
   let heldInboundTimer: NodeJS.Timeout | null = null;
   function dropHeldInboundMessage(messageId: string, receipt: { status: MessageReceiptStatus; detail?: string }): boolean {
     const index = heldInboundMessages.findIndex((entry) => entry.message.id === messageId);
@@ -776,6 +785,11 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
   }
   function handleMessageControl(control: MessageControl): void {
     replyTracker.dismissPendingAsk(control.messageId);
+    const pendingFollowUp = headlessFollowUps.get(control.messageId);
+    if (pendingFollowUp) {
+      emitMessageReceipt(control.messageId, "cancellation_requested", "already handed to native follow-up queue; cannot withdraw, may still be injected");
+      return;
+    }
     const supersededDetail = control.supersededBy ? `superseded by ${control.supersededBy}` : undefined;
     if (dropHeldInboundMessage(control.messageId, control.action === "cancel"
       ? { status: "cancelled", detail: "dropped before injection" }
@@ -1312,17 +1326,17 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     }
     return false;
   }
-  function sendIncomingMessage(entry: InboundMessageEntry, delivery: "trigger" | "steer", generation = runtimeGeneration, forceTrigger = false): void {
+  function sendIncomingMessage(entry: InboundMessageEntry, delivery: "trigger" | "steer" | "followUp", generation = runtimeGeneration, forceTrigger = false): void {
     if (runtimeStarted && !getLiveContext(runtimeContext, generation)) {
       emitMessageReceipt(entry.message.id, "expired", "session context no longer active before injection");
       return;
     }
-    const injectedMessage = { ...entry.message, injectedAt: Date.now() };
+    const injectedMessage = delivery === "followUp" ? { ...entry.message } : { ...entry.message, injectedAt: Date.now() };
     const replyCommand = delivery === "steer" && entry.replyCommand && entry.message.expectsReply
       ? `intercom({ action: "reply", replyTo: ${JSON.stringify(entry.message.id)}, message: "..." })`
       : entry.replyCommand;
     const deliveredEntry = { ...entry, message: injectedMessage, replyCommand };
-    replyTracker.queueTurnContext({ from: entry.from, message: injectedMessage, receivedAt: Date.now() });
+    if (delivery !== "followUp") replyTracker.queueTurnContext({ from: entry.from, message: injectedMessage, receivedAt: Date.now() });
     const senderDisplay = injectedMessage.crossMachine
       ? `${relaySenderName(injectedMessage.crossMachine.origin)} · unverified cross-machine`
       : entry.from.name || entry.from.id.slice(0, 8);
@@ -1338,7 +1352,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
         display: true,
         details: deliveredEntry,
       },
-      startTurn ? { triggerTurn: true } : trigger ? undefined : { deliverAs: "steer" }
+      delivery === "followUp" ? { deliverAs: "followUp" } : startTurn ? { triggerTurn: true } : trigger ? undefined : { deliverAs: "steer" }
     );
     // Pi before 1.2.0 skips before_agent_start for sendMessage({ triggerTurn: true }) turns (pi#5581),
     // so wake an idle session there with a user prompt that runs the normal prompt lifecycle.
@@ -1346,9 +1360,9 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       reserveIdleWake(triggerContext.sessionManager);
       pi.sendUserMessage("New intercom message above.", { deliverAs: "steer" });
     }
-    emitMessageReceipt(injectedMessage.id, "injected");
+    if (delivery !== "followUp") emitMessageReceipt(injectedMessage.id, "injected");
   }
-  function sendIncomingBrokerMessage(entry: InboundMessageEntry, delivery: "trigger" | "steer", generation = runtimeGeneration): void {
+  function sendIncomingBrokerMessage(entry: InboundMessageEntry, delivery: "trigger" | "steer" | "followUp", generation = runtimeGeneration): void {
     sendIncomingMessage(entry, delivery, generation);
   }
   function deliverIncomingBrokerMessage(entry: InboundMessageEntry, ctx: ExtensionContext, generation: number): void {
@@ -1356,12 +1370,33 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     if (!activeContext) return;
     if (!activeContext.isIdle()) {
       if (!activeContext.hasUI) {
+        if (config.headlessFollowUp && !entry.message.expectsReply) {
+          const bytes = Buffer.byteLength(entry.bodyText, "utf8");
+          const pendingBytes = [...headlessFollowUps.values()].reduce((sum, item) => sum + item.bytes, 0);
+          if (!agentRunning || !shouldTriggerInboundMessage(entry)) {
+            emitMessageReceipt(entry.message.id, "expired", "headless follow-up disabled by current trigger/lifecycle policy");
+          } else if (headlessFollowUps.size >= 32 || pendingBytes + bytes > 256 * 1024) {
+            emitMessageReceipt(entry.message.id, "expired", "headless follow-up queue limit reached (32 messages / 256 KiB)");
+          } else {
+            headlessFollowUps.set(entry.message.id, { bytes });
+            try {
+              sendIncomingBrokerMessage(entry, "followUp", generation);
+              emitMessageReceipt(entry.message.id, "queued", "native headless follow-up pending; not yet injected");
+            } catch {
+              headlessFollowUps.delete(entry.message.id);
+              emitMessageReceipt(entry.message.id, "expired", "native follow-up enqueue failed");
+            }
+          }
+          return;
+        }
         const activeClient = client;
         if (!entry.message.replyTo && activeClient?.isConnected()) {
           void (async () => {
             try {
               const result = await activeClient.send(entry.from.id, {
-                text: "This agent is running in non-interactive mode and cannot respond to intercom messages while it is working. It will continue its current task and exit when done.",
+                text: config.headlessFollowUp
+                  ? "This busy non-interactive session rejects blocking asks. Your ask was not queued or delivered to its model; use a non-blocking send for an opted-in follow-up."
+                  : "This agent is running in non-interactive mode and cannot respond to intercom messages while it is working. It will continue its current task and exit when done.",
                 replyTo: entry.message.id,
               });
               if (result.delivered && getLiveContext(ctx, generation)) dismissIncomingAsk(entry.message.id);
@@ -1411,12 +1446,14 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       return;
     }
     const receiverReceivedAt = Date.now();
-    if (hasSeenInboundMessage(from, message, receiverReceivedAt)) {
-      emitMessageReceipt(message.id, "acknowledged", "duplicate message id suppressed");
+    if (headlessFollowUps.has(message.id) || hasSeenInboundMessage(from, message, receiverReceivedAt)) {
+      const pending = headlessFollowUps.get(message.id);
+      emitMessageReceipt(message.id, pending ? "queued" : "acknowledged", "duplicate message id suppressed");
       return;
     }
     const receivedMessage = { ...message, receiverReceivedAt };
-    emitMessageReceipt(receivedMessage.id, "receiver_received");
+    const deferredHeadless = config.headlessFollowUp && !liveContext.hasUI && !liveContext.isIdle() && !message.expectsReply;
+    if (!deferredHeadless) emitMessageReceipt(receivedMessage.id, "receiver_received");
     if (replyWaiter) {
       const senderTarget = from.name || from.id;
       const fromMatches = senderTarget.toLowerCase() === replyWaiter.from.toLowerCase()
@@ -1438,7 +1475,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
         ? `intercom({ action: "reply", message: "..." })`
         : undefined;
     replyTracker.recordIncomingMessage(from, receivedMessage, receiverReceivedAt);
-    emitMessageReceipt(receivedMessage.id, "acknowledged", "accepted by receiver");
+    if (!deferredHeadless) emitMessageReceipt(receivedMessage.id, "acknowledged", "accepted by receiver");
     const entry = { from, message: receivedMessage, replyCommand, bodyText };
     // Busy without an agent run cannot steer; manual compaction can discard an appended custom entry.
     if (heldInboundMessages.length > 0 || (!liveContext.isIdle() && (!agentRunning || (config.busyDelivery === "human-first" && liveContext.hasUI)))) {
@@ -1607,7 +1644,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       return reconnectPromise;
     }
     const nextReconnectPromise = (async () => {
-      const nextClient = new IntercomClient();
+      const nextClient = new IntercomClient({ observeDelivery: config.headlessFollowUp });
       client = nextClient;
       attachClientHandlers(nextClient);
       let retryAfterFailure = false;
@@ -1966,7 +2003,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
         content: [{
           type: "text",
           text: result.delivery === "queued"
-            ? queuedText(display, inferredAsk ? "reply (inferred from pending ask)" : "message")
+            ? queuedText(display, inferredAsk ? "reply (inferred from pending ask)" : "message", result.injected === false)
             : target.projectPane
               ? `Opened Herdr project pane ${target.projectPane.paneId} for ${target.projectPane.projectRoot} and sent message to ${targetDisplay}`
               : inferredAsk ? `Reply sent to ${targetDisplay} (inferred from pending ask)` : `Message sent to ${display}${resolution}`,
@@ -2074,6 +2111,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     lastPresenceRuntimeFallbackAlias = initialPresenceIdentity.runtimeFallbackAlias;
     agentRunning = false;
     expireHeldInboundMessages("session replaced before injection");
+    expireHeadlessFollowUps("session replaced before injection");
     activeTools.clear();
     startNamePoll();
     const startupGeneration = runtimeGeneration;
@@ -2211,6 +2249,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     replyTracker.reset();
     agentRunning = false;
     expireHeldInboundMessages("session shut down before injection");
+    expireHeadlessFollowUps("session shut down before injection");
     activeTools.clear();
     if (client) {
       await client.disconnect();
@@ -2220,6 +2259,20 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     currentSessionId = null;
     currentIntercomSessionId = null;
     sessionStartedAt = null;
+  });
+  pi.on("context", (event) => {
+    if (headlessFollowUps.size === 0) return;
+    let observed = false;
+    for (const message of event.messages) {
+      if (message.role !== "custom" || message.customType !== "intercom_message") continue;
+      const id = (message.details as InboundMessageEntry | undefined)?.message?.id;
+      if (!id || !headlessFollowUps.delete(id)) continue;
+      const entry = message.details as InboundMessageEntry;
+      replyTracker.queueTurnContext({ from: entry.from, message: entry.message, receivedAt: Date.now() });
+      observed = true;
+      emitMessageReceipt(id, "injected", "observed in Pi provider context; not a claim of model processing");
+    }
+    if (observed) replyTracker.beginTurn();
   });
   pi.on("turn_end", (event, ctx) => {
     if (!getLiveContext()) {
@@ -2469,8 +2522,8 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
               subagent: { runId: metadata.runId, agent: metadata.agent, index: metadata.index },
             });
             return {
-              content: [{ type: "text", text: result.delivery === "queued" ? queuedText(metadata.orchestratorTarget, "progress update") : `Progress update sent to supervisor ${metadata.orchestratorTarget}${sent.resolution}` }],
-              details: { messageId: result.id, delivered: true },
+              content: [{ type: "text", text: result.delivery === "queued" ? queuedText(metadata.orchestratorTarget, "progress update", result.injected === false) : `Progress update sent to supervisor ${metadata.orchestratorTarget}${sent.resolution}` }],
+              details: deliveryDetails(result),
             };
           } catch (error) {
             return {
@@ -2966,7 +3019,7 @@ Usage:
               timestamp: Date.now(),
             });
             return {
-              content: [{ type: "text", text: result.delivery === "queued" ? queuedText(target.from.name || target.from.id, "reply") : `Reply sent to ${target.from.name || target.from.id}` }],
+              content: [{ type: "text", text: result.delivery === "queued" ? queuedText(target.from.name || target.from.id, "reply", result.injected === false) : `Reply sent to ${target.from.name || target.from.id}` }],
               details: { ...deliveryDetails(result), replyTo: target.message.id },
             };
           } catch (error) {
@@ -3008,7 +3061,7 @@ Usage:
             return {
               content: [{
                 type: "text",
-                text: `**Intercom status:**\nConnected: Yes\nSession ID: ${mySessionId}\nSession name: ${mySession?.name ?? "(unnamed)"} (short id: ${shortId})${pool ? `\nPool: ${pool}` : ""}\nActive sessions: ${sessions.length}`,
+                text: `**Intercom status:**\nConnected: Yes\nSession ID: ${mySessionId}\nSession name: ${mySession?.name ?? "(unnamed)"} (short id: ${shortId})${pool ? `\nPool: ${pool}` : ""}\nActive sessions: ${sessions.length}\nOutbound receipts (latest ten): ${JSON.stringify([...latestOutboundReceipts].slice(-10))}`,
               }],
               details: {},
             };
@@ -3395,7 +3448,7 @@ Usage:
         messageId: result.messageId,
         timestamp: Date.now(),
       });
-      notifyIfLive(ctx, result.queued ? queuedText(targetLabel) : `Message sent to ${targetLabel}`, "info", overlayGeneration);
+      notifyIfLive(ctx, result.queued ? queuedText(targetLabel, "message", config.headlessFollowUp) : `Message sent to ${targetLabel}`, "info", overlayGeneration);
     }
   }
 

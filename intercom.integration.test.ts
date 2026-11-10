@@ -3442,6 +3442,130 @@ test("steered inbound messages are not reinjected after shutdown", { concurrency
   }
 });
 
+test("opt-in headless sends queue natively and report injection only at the provider context boundary", { concurrency: false }, async (t) => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { planner, cleanup } = await setupClients();
+  const receipts: Array<{ messageId: string; status: string }> = [];
+  planner.on("message_receipt", (_from, receipt) => receipts.push(receipt));
+  let abortCount = 0;
+  const harness = createExtensionHarness("opt-in-pipe-worker", {
+    hasUI: false, isIdle: () => false, abort: () => { abortCount += 1; },
+  });
+  try {
+    await withIntercomConfig({ headlessFollowUp: true }, async () => {
+      const connect = t.mock.method(IntercomClient.prototype, "connect");
+      piIntercomExtension(harness.pi as never);
+      await harness.emitLifecycle("session_start");
+      await harness.emitLifecycle("agent_start");
+      const target = await waitForSessionByName(planner, "opt-in-pipe-worker");
+      await planner.send(target.id, { messageId: "opt-in-send-1", text: "follow-up nonce" });
+      await waitForCondition(() => harness.sentMessages.length === 1, "native follow-up queued");
+      assert.deepEqual(harness.sentMessages[0]!.options, { deliverAs: "followUp" });
+      await waitForCondition(() => receipts.some(r => r.status === "queued"), "queued receipt");
+      assert.equal(receipts.some(r => r.status === "injected"), false);
+      // A long tool run can outlive broker and receiver dedupe retention.
+      const receiver = connect.mock.calls.find(call => (call.this as IntercomClient).sessionId === target.id)!.this as IntercomClient;
+      const entry = harness.sentMessages[0]!.message.details as { from: SessionInfo; message: Message };
+      const future = Date.now() + 60 * 60 * 1000 + 1;
+      const clock = t.mock.method(Date, "now", () => future);
+      try { receiver.emit("message", entry.from, entry.message); } finally { clock.mock.restore(); }
+      assert.equal(harness.sentMessages.length, 1, "pending native ID must stay deduped after normal cache expiry");
+      const message = { role: "custom", ...harness.sentMessages[0]!.message };
+      await harness.emitLifecycleResults("context", { messages: [message] });
+      await waitForCondition(() => receipts.some(r => r.status === "injected"), "observed injection receipt");
+      assert.equal(abortCount, 0);
+      const intercom = harness.tools.find(tool => tool.name === "intercom")!;
+      const replyResult = await intercom.execute("native-reply", { action: "reply", message: "nonce observed" }, new AbortController().signal, undefined, harness.ctx);
+      // Upstream broker permits replyTo only for asks; resolving the visible plain sender must reach that guard.
+      assert.equal(replyResult.details?.code, "E_REPLY_TARGET", JSON.stringify(replyResult));
+    });
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("opt-in headless queue preserves FIFO and dedupe, enforces count/byte bounds and rejects asks immediately", { concurrency: false }, async () => {
+  const { default: extension } = await import("./index.ts");
+  const setup = await setupClients();
+  const parent = new IntercomClient({ observeDelivery: true });
+  const receipts: Array<{ messageId: string; status: string; detail?: string }> = [];
+  parent.on("message_receipt", (_from, receipt) => receipts.push(receipt));
+  const harness = createExtensionHarness("bounded-pipe", { hasUI: false, isIdle: () => false });
+  try {
+    await parent.connect({ cwd: repoDir, model: "test", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() });
+    await withIntercomConfig({ headlessFollowUp: true }, async () => {
+      extension(harness.pi as never);
+      await harness.emitLifecycle("session_start");
+      await harness.emitLifecycle("agent_start");
+      const target = await waitForSessionByName(parent, "bounded-pipe");
+      const tooLarge = await parent.send(target.id, { text: "x".repeat(256 * 1024 + 1), messageId: "too-large" });
+      assert.equal(tooLarge.delivered, false);
+      assert.match(tooLarge.reason!, /queue limit/);
+      for (let n = 0; n < 32; n++) {
+        const result = await parent.send(target.id, { text: "nonce-" + n, messageId: "fifo-" + n });
+        assert.equal(result.delivery, "queued");
+        assert.equal(result.injected, false);
+      }
+      const duplicate = await parent.send(target.id, { text: "nonce-0", messageId: "fifo-0" });
+      assert.equal(duplicate.delivery, "queued");
+      assert.equal(harness.sentMessages.length, 32);
+      const overflow = await parent.send(target.id, { text: "overflow", messageId: "overflow" });
+      assert.equal(overflow.delivered, false);
+      assert.match(overflow.reason!, /queue limit/);
+      const replyPromise = waitForReply(parent, "opt-in-blocking-ask", 1500);
+      await parent.send(target.id, { text: "blocking ask", messageId: "opt-in-blocking-ask", expectsReply: true });
+      const reply = await replyPromise;
+      assert.match(reply.message.content.text, /rejects blocking asks.*not queued/);
+      assert.equal(harness.sentMessages.length, 32);
+      await parent.cancelMessage("fifo-0");
+      await waitForCondition(() => receipts.some(r => r.messageId === "fifo-0" && r.status === "cancellation_requested"), "honest native cancellation limitation");
+      assert.equal(receipts.some(r => r.status === "injected"), false);
+      const messages = harness.sentMessages.map(({ message }) => ({ role: "custom", ...message }));
+      assert.deepEqual(messages.map(m => (m.details as any).message.id), Array.from({ length: 32 }, (_, n) => "fifo-" + n));
+      await harness.emitLifecycleResults("context", { messages });
+      await waitForCondition(() => receipts.filter(r => r.status === "injected").length === 32, "all native FIFO entries observed");
+      assert.deepEqual(receipts.filter(r => r.status === "injected").map(r => r.messageId), Array.from({ length: 32 }, (_, n) => "fifo-" + n));
+      await harness.emitLifecycleResults("context", { messages });
+      assert.equal(receipts.filter(r => r.status === "injected").length, 32, "repeated provider context must not duplicate injection receipts");
+      const afterDrain = await parent.send(target.id, { text: "after drain", messageId: "after-drain" });
+      assert.equal(afterDrain.delivery, "queued");
+      await harness.emitLifecycle("session_shutdown");
+      await waitForCondition(() => receipts.some(r => r.messageId === "after-drain" && r.status === "expired"), "shutdown reports pending message expired");
+    });
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await parent.disconnect();
+    await setup.cleanup();
+  }
+});
+
+test("opt-in headless sends respect inboundTrigger never and replies", { concurrency: false }, async () => {
+  const { default: extension } = await import("./index.ts");
+  for (const inboundTrigger of ["never", "replies"]) {
+    const setup = await setupClients();
+    const parent = new IntercomClient({ observeDelivery: true });
+    const harness = createExtensionHarness("policy-pipe", { hasUI: false, isIdle: () => false });
+    try {
+      await parent.connect({ cwd: repoDir, model: "test", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() });
+      await withIntercomConfig({ headlessFollowUp: true, inboundTrigger }, async () => {
+        extension(harness.pi as never);
+        await harness.emitLifecycle("session_start");
+        await harness.emitLifecycle("agent_start");
+        const target = await waitForSessionByName(parent, "policy-pipe");
+        const result = await parent.send(target.id, { text: "must not wake" });
+        assert.equal(result.delivered, false);
+        assert.match(result.reason!, /policy/);
+        assert.equal(harness.sentMessages.length, 0);
+      });
+    } finally {
+      await harness.emitLifecycle("session_shutdown");
+      await parent.disconnect();
+      await setup.cleanup();
+    }
+  }
+});
+
 test("busy non-interactive sessions auto-reply to top-level asks without aborting", { concurrency: false }, async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
   const { planner, cleanup } = await setupClients();

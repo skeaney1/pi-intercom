@@ -1,6 +1,6 @@
 {
   "name": "pi-intercom",
-  "version": "0.18.1",
+  "version": "0.18.1-headless.1",
   "license": "MIT",
   "type": "module",
   "main": "index.ts",
@@ -9,6 +9,8 @@
   },
   "files": [
     "cli.mjs",
+    "FORK.md",
+    "reproduce.mjs",
     "cli.ts",
     "cross-machine-discovery.ts",
     "cross-machine-envelope.ts",

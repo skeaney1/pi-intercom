@@ -26,7 +26,7 @@ class MemorySink {
 
 interface FakeClientOptions {
   sessions?: SessionInfo[];
-  sendResult?: { id: string; delivered: boolean; reason?: string };
+  sendResult?: { id: string; delivered: boolean; reason?: string; delivery?: string; injected?: boolean };
   replyOnSend?: { from: SessionInfo; text: string };
   unrelatedReplyOnSend?: boolean;
   sendError?: Error;
@@ -101,6 +101,18 @@ function sessionFixture(overrides: Partial<SessionInfo> = {}): SessionInfo {
     ...overrides,
   };
 }
+
+test("runCli queued sends report acceptance, not injection or delivery", async () => {
+  const client = new FakeClient({ sendResult: { id: "queued-id", delivered: true, delivery: "queued", injected: false } });
+  const out = new MemorySink();
+  assert.equal(await runCli(["send", "--to", "worker", "--text", "nonce", "--json"], { client, out }), 0);
+  const result = JSON.parse(out.text());
+  assert.equal(result.accepted, true);
+  assert.equal(result.delivered, false);
+  assert.equal(result.injected, false);
+  assert.equal(result.delivery, "queued");
+  assert.equal(client.disconnected, true);
+});
 
 test("parseCliArgs accepts list with defaults", () => {
   const opts = parseCliArgs(["list"]);
