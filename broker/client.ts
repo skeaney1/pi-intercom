@@ -36,6 +36,8 @@ export interface SendResult extends DeliveryDetails {
   id: string;
   delivered: boolean;
   reason?: string;
+  /** True only after a receiver context receipt; false means accepted but pending. */
+  injected?: boolean;
 }
 
 function toError(error: unknown): Error {
@@ -74,6 +76,24 @@ function parseSessionHolder(value: unknown): SessionHolder {
 }
 
 export class IntercomClient extends EventEmitter {
+  private readonly queuedObservations = new Map<string, SessionInfo>();
+  constructor(private readonly options: { observeDelivery?: boolean } = {}) {
+    super();
+  }
+
+  private expireQueuedObservations(sessionId?: string): void {
+    for (const [id, from] of this.queuedObservations) {
+      if (sessionId && from.id !== sessionId) continue;
+      this.queuedObservations.delete(id);
+      const receipt: MessageReceipt = {
+        messageId: id, status: "expired", timestamp: Date.now(),
+        detail: sessionId ? "receiver disconnected before confirmed Pi injection; delivery is unconfirmed, do not retry blindly" : "sender/broker observation ended before confirmed Pi injection; delivery is unconfirmed, do not retry blindly",
+      };
+      this.emit("broker_message", { type: "message_receipt", from, receipt });
+      this.emit("message_receipt", from, receipt);
+    }
+  }
+
   private socket: net.Socket | null = null;
   private _sessionId: string | null = null;
   private _features = new Set<string>();
@@ -86,6 +106,7 @@ export class IntercomClient extends EventEmitter {
   private livenessInFlight = false;
 
   private failPending(error: Error): void {
+    this.expireQueuedObservations();
     for (const pending of this.pendingSends.values()) {
       pending.reject(error);
     }
@@ -423,6 +444,10 @@ export class IntercomClient extends EventEmitter {
           throw new Error("Invalid message_receipt event");
         }
         this.emit("broker_message", brokerMessage as BrokerMessage);
+        if (brokerMessage.receipt.status === "injected" || brokerMessage.receipt.status === "expired"
+          || brokerMessage.receipt.status === "cancelled" || brokerMessage.receipt.status === "superseded") {
+          this.queuedObservations.delete(brokerMessage.receipt.messageId);
+        }
         this.emit("message_receipt", brokerMessage.from, brokerMessage.receipt);
         break;
       }
@@ -452,6 +477,7 @@ export class IntercomClient extends EventEmitter {
           throw new Error("Invalid session_left message");
         }
 
+        this.expireQueuedObservations(brokerMessage.sessionId);
         const message: BrokerMessage = { type: "session_left", sessionId: brokerMessage.sessionId };
         this.emit("broker_message", message);
         this.emit("session_left", brokerMessage.sessionId);
@@ -636,6 +662,52 @@ export class IntercomClient extends EventEmitter {
   }
 
   async send(to: string, options: SendOptions): Promise<SendResult> {
+    if (!this.options.observeDelivery || options.expectsReply || options.replyTo) return this.sendTransport(to, options);
+    const id = options.messageId ?? randomUUID();
+    return new Promise<SendResult>((resolve) => {
+      let settled = false;
+      const finish = (result: SendResult) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.off("message_receipt", onReceipt);
+        this.off("disconnected", onDisconnect);
+        resolve(result);
+      };
+      const unknown = (reason: string) => finish({
+        id, delivered: false, delivery: "unknown", retryable: false, outcomeKnown: false, reason,
+      });
+      const onReceipt = (from: SessionInfo, receipt: MessageReceipt) => {
+        if (receipt.messageId !== id) return;
+        if (receipt.status === "queued") {
+          if (this.queuedObservations.size >= 4096) {
+            unknown("delivery observation limit reached; injection unconfirmed");
+            return;
+          }
+          this.queuedObservations.set(id, from);
+          finish({ id, delivered: true, injected: false, delivery: "queued", retryable: false, outcomeKnown: true });
+        } else if (receipt.status === "injected") {
+          finish({ id, delivered: true, injected: true, delivery: "socket_delivered", retryable: false, outcomeKnown: true });
+        } else if (receipt.status === "expired" || receipt.status === "cancelled" || receipt.status === "superseded") {
+          finish({ id, delivered: false, injected: false, delivery: "failed", retryable: false, outcomeKnown: true, reason: receipt.detail ?? receipt.status });
+        }
+      };
+      const onDisconnect = () => unknown("broker disconnected before confirmed injection");
+      const timer = setTimeout(() => unknown("no queued or injected receipt within ten seconds"), 10_000);
+      this.on("message_receipt", onReceipt);
+      this.on("disconnected", onDisconnect);
+      void this.sendTransport(to, { ...options, messageId: id }).then((result) => {
+        if (!result.delivered || result.delivery === "queued") {
+          finish({ ...result, injected: false });
+        } else if (this.queuedObservations.has(id)) {
+          // The broker validated an identical retry; do not promote its transport replay to injection.
+          finish({ ...result, delivery: "queued", injected: false });
+        }
+      }, () => unknown("transport failed before confirmed injection"));
+    });
+  }
+
+  private async sendTransport(to: string, options: SendOptions): Promise<SendResult> {
     let socket: net.Socket;
     try {
       socket = this.requireActiveSocket();

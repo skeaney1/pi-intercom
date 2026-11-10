@@ -42,6 +42,7 @@ test("loadConfig defaults inboundTrigger to current auto-trigger behavior", asyn
     await withAgentDir(root, () => {
       assert.equal(loadConfig().inboundTrigger, "always");
       assert.equal(loadConfig().busyDelivery, "steer");
+      assert.equal(loadConfig().headlessFollowUp, false);
     });
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -74,6 +75,25 @@ test("loadConfig accepts cross-machine overrides", async () => {
         machineName: "laptop",
         remoteCommand: "/opt/tools/pi-intercom",
       });
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig accepts only a boolean headlessFollowUp opt-in", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-intercom-config-"));
+  try {
+    mkdirSync(join(root, "intercom"));
+    await withAgentDir(root, () => {
+      for (const value of [true, false]) {
+        writeFileSync(join(root, "intercom", "config.json"), JSON.stringify({ headlessFollowUp: value }));
+        assert.equal(loadConfig().headlessFollowUp, value);
+      }
+      for (const value of ["true", 1, null, []]) {
+        writeFileSync(join(root, "intercom", "config.json"), JSON.stringify({ headlessFollowUp: value }));
+        assert.throws(() => loadConfig(), /must be a boolean/);
+      }
     });
   } finally {
     rmSync(root, { recursive: true, force: true });
